@@ -6,6 +6,7 @@ import android.content.Intent
 import android.content.pm.PackageManager
 import android.location.Location
 import android.os.Build
+import android.os.Bundle
 import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
@@ -330,6 +331,9 @@ class LocationService : Service() {
     }
 
     private fun publishLocationData(location: Location) {
+        // Determinar la ciudad desde los extras, o usar "Desconocido" como valor por defecto
+        val city = location.extras?.getString("city") ?: "Desconocido"
+
         // Crear payload JSON
         val payload = JSONObject().apply {
             put("deviceId", clientId)
@@ -338,6 +342,7 @@ class LocationService : Service() {
             put("longitude", location.longitude)
             put("accuracy", location.accuracy)
             put("isMock", location.isFromMockProvider)
+            put("city", city) // Añadir la ciudad
         }
 
         // Decidir si usar almacenamiento local o AWS IoT
@@ -596,31 +601,56 @@ class LocationService : Service() {
     }
 
     private fun startMockLocationUpdates() {
-        Log.d(TAG, "🔵 Iniciando simulación de ubicaciones")
+        Log.d(TAG, "🔵 Iniciando simulación de ubicaciones en el Área Metropolitana de Medellín")
 
-        // Ubicación inicial (Ciudad de México)
-        val initialLat = 19.432608
-        val initialLng = -99.133209
+        // Definir coordenadas para las tres ciudades
+        val locations = arrayOf(
+            // Bello - varios puntos
+            Pair(6.333333, -75.558333),  // Centro de Bello
+            Pair(6.339722, -75.554722),  // Barrio Niquía
+            Pair(6.320833, -75.570278),  // Barrio Cabañas
+            Pair(6.346111, -75.542778),  // Barrio La Cumbre
 
-        // Generar primera ubicación
-        sendMockLocation(initialLat, initialLng)
+            // Medellín - varios puntos
+            Pair(6.244747, -75.573101),  // Centro de Medellín
+            Pair(6.210129, -75.572380),  // El Poblado
+            Pair(6.256773, -75.589861),  // Laureles
+            Pair(6.231144, -75.586700),  // Estadio
+
+            // Envigado - varios puntos
+            Pair(6.175742, -75.591370),  // Centro de Envigado
+            Pair(6.168900, -75.574300),  // Zona norte de Envigado
+            Pair(6.184722, -75.585833),  // Barrio La Sebastiana
+            Pair(6.163889, -75.594444)   // Barrio La Mina
+        )
 
         // Programar actualizaciones periódicas
         val mockRunnable = object : Runnable {
-            private var currentLat = initialLat
-            private var currentLng = initialLng
+            private var currentLocationIndex = (Math.random() * locations.size).toInt()
             private var count = 0
 
             override fun run() {
-                // Modificar ligeramente las coordenadas para simular movimiento
-                currentLat += 0.0001 * (Math.random() - 0.5)
-                currentLng += 0.0001 * (Math.random() - 0.5)
+                // Elegir una ubicación aleatoria
+                currentLocationIndex = (Math.random() * locations.size).toInt()
+                val selectedLocation = locations[currentLocationIndex]
 
-                sendMockLocation(currentLat, currentLng)
+                // Añadir pequeña variación para simular movimiento
+                val randomLat = selectedLocation.first + 0.001 * (Math.random() - 0.5)
+                val randomLng = selectedLocation.second + 0.001 * (Math.random() - 0.5)
+
+                // Determinar la ciudad basado en el índice
+                val city = when(currentLocationIndex) {
+                    in 0..3 -> "Bello"
+                    in 4..7 -> "Medellín"
+                    else -> "Envigado"
+                }
+
+                // Enviar ubicación y metadatos adicionales
+                sendMockLocation(randomLat, randomLng, city)
 
                 count++
-                if (count < 100) { // Limitar a 100 actualizaciones
-                    mainHandler.postDelayed(this, 5000) // Cada 5 segundos
+                if (count < 1000) { // Limitar a 1000 actualizaciones
+                    mainHandler.postDelayed(this, 10000) // Cada 10 segundos
                 }
             }
         }
@@ -628,18 +658,23 @@ class LocationService : Service() {
         // Guardar referencia al runnable
         locationUpdateRunnable.add(mockRunnable)
 
-        // Iniciar el runnable
-        mainHandler.postDelayed(mockRunnable, 5000)
+        // Iniciar el runnable de inmediato y luego periódicamente
+        mockRunnable.run()
     }
 
-    private fun sendMockLocation(latitude: Double, longitude: Double) {
+    private fun sendMockLocation(latitude: Double, longitude: Double, city: String = "") {
         val mockLocation = Location("mock")
         mockLocation.latitude = latitude
         mockLocation.longitude = longitude
-        mockLocation.accuracy = 10f
+        mockLocation.accuracy = 5f + (Math.random() * 10).toFloat() // Precisión entre 5 y 15 metros
         mockLocation.time = System.currentTimeMillis()
 
-        Log.d(TAG, "📍 Ubicación simulada generada: $latitude, $longitude")
+        // Añadir extras para transportar metadatos adicionales
+        val bundle = Bundle()
+        bundle.putString("city", city)
+        mockLocation.extras = bundle
+
+        Log.d(TAG, "📍 Ubicación simulada generada en $city: $latitude, $longitude")
 
         // Procesar la ubicación simulada como si fuera real
         handleNewLocation(mockLocation)
