@@ -1,6 +1,7 @@
 package com.example.locationdevice
 
 import android.Manifest
+import android.app.ActivityManager
 import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
@@ -107,14 +108,28 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    @OptIn(UnstableApi::class)
     private fun stopLocationService() {
-        val serviceIntent = Intent(this, LocationService::class.java)
-        stopService(serviceIntent)
+        try {
+            Log.d("MainActivity", "Deteniendo servicio de ubicación")
 
-        updateButtonStates(true)
-        statusTextView.text = "Servicio detenido"
-        locationTextView.text = "Ubicación: No disponible"
-        Toast.makeText(this, "Servicio de ubicación detenido", Toast.LENGTH_SHORT).show()
+            // Crear intent para detener el servicio
+            val serviceIntent = Intent(this, LocationService::class.java)
+
+            // Detener el servicio
+            stopService(serviceIntent)
+
+            // Actualizar UI
+            updateButtonStates(true)
+            statusTextView.text = "Servicio detenido"
+            locationTextView.text = "Ubicación: No disponible"
+
+            Toast.makeText(this, "Servicio de ubicación detenido", Toast.LENGTH_SHORT).show()
+            Log.d("MainActivity", "Servicio detenido exitosamente")
+        } catch (e: Exception) {
+            Log.e("MainActivity", "Error al detener el servicio: ${e.message}", e)
+            Toast.makeText(this, "Error al detener el servicio: ${e.message}", Toast.LENGTH_LONG).show()
+        }
     }
 
     private fun updateButtonStates(serviceNotRunning: Boolean) {
@@ -123,7 +138,14 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun isServiceRunning(): Boolean {
-        // Implementación simple
+        val activityManager = getSystemService(Context.ACTIVITY_SERVICE) as ActivityManager
+
+        for (service in activityManager.getRunningServices(Integer.MAX_VALUE)) {
+            if (LocationService::class.java.name == service.service.className) {
+                return true
+            }
+        }
+
         return false
     }
 
@@ -161,8 +183,22 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    @OptIn(UnstableApi::class)
     override fun onDestroy() {
-        LocalBroadcastManager.getInstance(this).unregisterReceiver(locationReceiver)
+        // Intentar detener el servicio si la app se cierra
+        try {
+            stopLocationService()
+        } catch (e: Exception) {
+            Log.e("MainActivity", "Error deteniendo servicio al cerrar: ${e.message}")
+        }
+
+        // Anular registro del receptor de broadcast
+        try {
+            LocalBroadcastManager.getInstance(this).unregisterReceiver(locationReceiver)
+        } catch (e: Exception) {
+            Log.e("MainActivity", "Error al anular registro de receptor: ${e.message}")
+        }
+
         super.onDestroy()
     }
 }

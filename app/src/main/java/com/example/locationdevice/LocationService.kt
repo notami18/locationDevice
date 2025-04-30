@@ -59,6 +59,10 @@ class LocationService : Service() {
     private val NOTIFICATION_ID = 12345
     private val CHANNEL_ID = "location_service_channel"
 
+    private val mainHandler = Handler(Looper.getMainLooper())
+    private val locationUpdateRunnable = mutableListOf<Runnable>()
+
+
     override fun onCreate() {
         super.onCreate()
         try {
@@ -495,10 +499,16 @@ class LocationService : Service() {
         // Procesar esta ubicación simulada
         handleNewLocation(mockLocation)
 
-        // Programar otra actualización simulada en 10 segundos
-        Handler(Looper.getMainLooper()).postDelayed({
+        // Crear runnable para próxima actualización
+        val mockGenRunnable = Runnable {
             generateMockLocation()
-        }, 10000)
+        }
+
+        // Guardar referencia
+        locationUpdateRunnable.add(mockGenRunnable)
+
+        // Programar otra actualización simulada en 10 segundos
+        mainHandler.postDelayed(mockGenRunnable, 10000)
     }
 
     private fun setupLocationCallback() {
@@ -596,8 +606,7 @@ class LocationService : Service() {
         sendMockLocation(initialLat, initialLng)
 
         // Programar actualizaciones periódicas
-        val handler = Handler(Looper.getMainLooper())
-        handler.postDelayed(object : Runnable {
+        val mockRunnable = object : Runnable {
             private var currentLat = initialLat
             private var currentLng = initialLng
             private var count = 0
@@ -611,10 +620,16 @@ class LocationService : Service() {
 
                 count++
                 if (count < 100) { // Limitar a 100 actualizaciones
-                    handler.postDelayed(this, 5000) // Cada 5 segundos
+                    mainHandler.postDelayed(this, 5000) // Cada 5 segundos
                 }
             }
-        }, 5000)
+        }
+
+        // Guardar referencia al runnable
+        locationUpdateRunnable.add(mockRunnable)
+
+        // Iniciar el runnable
+        mainHandler.postDelayed(mockRunnable, 5000)
     }
 
     private fun sendMockLocation(latitude: Double, longitude: Double) {
@@ -652,16 +667,40 @@ class LocationService : Service() {
     }
 
     override fun onDestroy() {
-        Log.d(TAG, "Servicio destruido")
-        stopLocationUpdates()
+        Log.d(TAG, "🔴 Servicio destruido - deteniendo todas las operaciones")
 
+        // Detener actualizaciones de ubicación
         try {
-            mqttClient?.disconnect()
+            stopLocationUpdates()
+        } catch (e: Exception) {
+            Log.e(TAG, "Error al detener actualizaciones de ubicación: ${e.message}")
+        }
+
+        // Cancelar todos los runnables programados
+        for (runnable in locationUpdateRunnable) {
+            mainHandler.removeCallbacks(runnable)
+        }
+        locationUpdateRunnable.clear()
+
+        // Desconectar MQTT
+        try {
+            if (mqttClient?.isConnected == true) {
+                mqttClient?.disconnect()
+            }
             mqttClient?.close()
         } catch (e: Exception) {
             Log.e(TAG, "Error al desconectar MQTT: ${e.message}")
         }
 
+        // Detener el servicio en primer plano
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            stopForeground(true)
+        }
+
+        // Enviar actualización de estado
+        sendStatusUpdate("Servicio detenido")
+
+        // Llamar al método onDestroy de la superclase
         super.onDestroy()
     }
 
