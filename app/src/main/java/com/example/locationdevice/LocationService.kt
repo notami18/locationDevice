@@ -63,6 +63,10 @@ class LocationService : Service() {
     private val mainHandler = Handler(Looper.getMainLooper())
     private val locationUpdateRunnable = mutableListOf<Runnable>()
 
+    // Parámetros de ubicación real
+    private val UPDATE_INTERVAL = 5000L  // 5 segundos entre actualizaciones
+    private val FASTEST_INTERVAL = 3000L // No solicitar más rápido que esto
+    private val SMALLEST_DISPLACEMENT = 5f // 5 metros mínimo para actualizar
 
     override fun onCreate() {
         super.onCreate()
@@ -85,18 +89,15 @@ class LocationService : Service() {
             setupLocationCallback()
 
             // Iniciar como servicio en primer plano con notificación
-            startForeground(NOTIFICATION_ID, createNotification("Iniciando servicio..."))
+            startForeground(NOTIFICATION_ID, createNotification("Iniciando servicio de ubicación..."))
 
             // Listar archivos en assets para debug
             listAssetFiles()
 
-            // Primero probar conectividad básica
+            // Probar conectividad básica
             checkConnectivity()
 
-            // Generar ubicación simulada
-            generateMockLocation()
-
-            // Iniciar actualizaciones de ubicación reales
+            // Iniciar actualizaciones de ubicación reales - IMPORTANTE
             startLocationUpdates()
 
             Log.d(TAG, "🟢 Servicio iniciado completamente")
@@ -110,11 +111,6 @@ class LocationService : Service() {
         Thread {
             try {
                 Log.d(TAG, "🔍 Verificando conectividad con AWS IoT endpoint...")
-
-                // Verificar si estamos en emulador
-                if (isEmulator()) {
-                    Log.w(TAG, "⚠️ Ejecutando en emulador - podría haber restricciones de red")
-                }
 
                 // Intentar hacer ping al endpoint
                 try {
@@ -241,7 +237,7 @@ class LocationService : Service() {
                         Log.e(TAG, "Conexión AWS IoT perdida: ${cause?.message}")
                         isConnecting.set(false)
 
-                        // Programar un intento de reconexión con retraso exponencial
+                        // Programar un intento de reconexión con retraso
                         val delay = 5000L  // 5 segundos
                         Handler(Looper.getMainLooper()).postDelayed({
                             if (!mqttClient?.isConnected!! == true) {
@@ -331,8 +327,8 @@ class LocationService : Service() {
     }
 
     private fun publishLocationData(location: Location) {
-        // Determinar la ciudad desde los extras, o usar "Desconocido" como valor por defecto
-        val city = location.extras?.getString("city") ?: "Desconocido"
+        // Determinar la ciudad basada en la ubicación
+        val city = determinarCiudad(location.latitude, location.longitude)
 
         // Crear payload JSON
         val payload = JSONObject().apply {
@@ -341,8 +337,11 @@ class LocationService : Service() {
             put("latitude", location.latitude)
             put("longitude", location.longitude)
             put("accuracy", location.accuracy)
+            put("altitude", if (location.hasAltitude()) location.altitude else 0.0)
+            put("speed", if (location.hasSpeed()) location.speed else 0.0f)
+            put("bearing", if (location.hasBearing()) location.bearing else 0.0f)
             put("isMock", location.isFromMockProvider)
-            put("city", city) // Añadir la ciudad
+            put("city", city)
         }
 
         // Decidir si usar almacenamiento local o AWS IoT
@@ -353,6 +352,50 @@ class LocationService : Service() {
             // Enviar a AWS IoT
             publishToAwsIot(payload)
         }
+    }
+
+    // Función para determinar la ciudad basada en coordenadas
+    private fun determinarCiudad(latitude: Double, longitude: Double): String {
+        // Definir regiones de ciudades (versión simplificada)
+        val regiones = listOf(
+            Triple("Bello", 6.333333, -75.558333),       // Centro de Bello
+            Triple("Medellín", 6.244747, -75.573101),    // Centro de Medellín
+            Triple("Envigado", 6.175742, -75.591370)     // Centro de Envigado
+        )
+
+        // Encontrar la ciudad más cercana
+        var ciudadMasCercana = "Área Metropolitana"
+        var distanciaMinima = Double.MAX_VALUE
+
+        for (region in regiones) {
+            val distancia = calcularDistancia(
+                latitude, longitude,
+                region.second, region.third
+            )
+
+            if (distancia < distanciaMinima) {
+                distanciaMinima = distancia
+                ciudadMasCercana = region.first
+            }
+        }
+
+        return ciudadMasCercana
+    }
+
+    // Cálculo de distancia utilizando la fórmula Haversine
+    private fun calcularDistancia(lat1: Double, lon1: Double, lat2: Double, lon2: Double): Double {
+        val radioTierra = 6371.0 // Radio de la Tierra en kilómetros
+
+        val dLat = Math.toRadians(lat2 - lat1)
+        val dLon = Math.toRadians(lon2 - lon1)
+
+        val a = Math.sin(dLat / 2) * Math.sin(dLat / 2) +
+                Math.cos(Math.toRadians(lat1)) * Math.cos(Math.toRadians(lat2)) *
+                Math.sin(dLon / 2) * Math.sin(dLon / 2)
+
+        val c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a))
+
+        return radioTierra * c // Distancia en kilómetros
     }
 
     private fun saveLocationLocally(payload: JSONObject) {
@@ -491,31 +534,6 @@ class LocationService : Service() {
         }
     }
 
-    private fun generateMockLocation() {
-        Log.d(TAG, "Generando ubicación simulada ya que no recibimos actualizaciones reales")
-
-        // Coordenadas de ejemplo (Ciudad de México)
-        val mockLocation = Location("MockProvider")
-        mockLocation.latitude = 19.432608
-        mockLocation.longitude = -99.133209
-        mockLocation.accuracy = 10.0f
-        mockLocation.time = System.currentTimeMillis()
-
-        // Procesar esta ubicación simulada
-        handleNewLocation(mockLocation)
-
-        // Crear runnable para próxima actualización
-        val mockGenRunnable = Runnable {
-            generateMockLocation()
-        }
-
-        // Guardar referencia
-        locationUpdateRunnable.add(mockGenRunnable)
-
-        // Programar otra actualización simulada en 10 segundos
-        mainHandler.postDelayed(mockGenRunnable, 10000)
-    }
-
     private fun setupLocationCallback() {
         locationCallback = object : LocationCallback() {
             override fun onLocationResult(locationResult: LocationResult) {
@@ -530,11 +548,12 @@ class LocationService : Service() {
         val lat = location.latitude
         val lng = location.longitude
         val acc = location.accuracy
+        val city = determinarCiudad(lat, lng)
 
-        Log.d(TAG, "📍 UBICACIÓN RECIBIDA: $lat, $lng (±$acc m)")
+        Log.d(TAG, "📍 UBICACIÓN REAL RECIBIDA: $lat, $lng (±$acc m) en $city")
 
         // Actualizar notificación
-        updateNotification("Ubicación: $lat, $lng")
+        updateNotification("Ubicación: $lat, $lng en $city")
 
         // Enviar a UI mediante broadcast
         sendLocationBroadcast(location)
@@ -545,7 +564,7 @@ class LocationService : Service() {
 
     private fun startLocationUpdates() {
         try {
-            Log.d(TAG, "🔵 Iniciando solicitud de ubicación...")
+            Log.d(TAG, "🔵 Iniciando solicitud de ubicación real...")
 
             if (ActivityCompat.checkSelfPermission(this, android.Manifest.permission.ACCESS_FINE_LOCATION) != PackageManager.PERMISSION_GRANTED) {
                 Log.e(TAG, "❌ ERROR: Sin permisos para solicitar ubicación")
@@ -559,125 +578,31 @@ class LocationService : Service() {
                     handleNewLocation(location)
                 } else {
                     Log.w(TAG, "⚠️ No hay última ubicación conocida disponible")
-
-                    // Como estamos en simulador, generamos una ubicación simulada
-                    if (isEmulator()) {
-                        Log.d(TAG, "📱 Ejecutando en emulador - generando ubicación simulada")
-                        startMockLocationUpdates()
-                    }
                 }
             }
 
-            // Configurar solicitud de ubicaciones reales
-            val locationRequest = LocationRequest.Builder(5000) // 5 segundos
-                .setPriority(Priority.PRIORITY_HIGH_ACCURACY)
-                .setMinUpdateDistanceMeters(5f) // 5 metros
-                .setWaitForAccurateLocation(false)
+            // Configurar solicitud de ubicaciones REALES - CLAVE PARA USAR GPS REAL
+            val locationRequest = LocationRequest.Builder(UPDATE_INTERVAL)
+                .setPriority(Priority.PRIORITY_HIGH_ACCURACY) // IMPORTANTE: Alta precisión = GPS
+                .setMinUpdateDistanceMeters(SMALLEST_DISPLACEMENT)
+                .setMinUpdateIntervalMillis(FASTEST_INTERVAL)
+                .setWaitForAccurateLocation(true) // Esperar precisión alta
                 .build()
 
+            // Iniciar actualizaciones
             fusedLocationClient.requestLocationUpdates(
                 locationRequest,
                 locationCallback,
                 Looper.getMainLooper()
             )
 
-            Log.d(TAG, "✅ Solicitud de ubicación configurada correctamente")
+            Log.d(TAG, "✅ Solicitud de ubicación real configurada correctamente")
 
         } catch (e: SecurityException) {
             Log.e(TAG, "❌ Error de permisos: ${e.message}")
         } catch (e: Exception) {
             Log.e(TAG, "❌ Error general al solicitar ubicación: ${e.message}")
         }
-    }
-
-    private fun isEmulator(): Boolean {
-        return (Build.FINGERPRINT.startsWith("generic")
-                || Build.FINGERPRINT.startsWith("unknown")
-                || Build.MODEL.contains("google_sdk")
-                || Build.MODEL.contains("Emulator")
-                || Build.MODEL.contains("Android SDK built for")
-                || Build.MANUFACTURER.contains("Genymotion")
-                || Build.BRAND.startsWith("generic") && Build.DEVICE.startsWith("generic"))
-    }
-
-    private fun startMockLocationUpdates() {
-        Log.d(TAG, "🔵 Iniciando simulación de ubicaciones en el Área Metropolitana de Medellín")
-
-        // Definir coordenadas para las tres ciudades
-        val locations = arrayOf(
-            // Bello - varios puntos
-            Pair(6.333333, -75.558333),  // Centro de Bello
-            Pair(6.339722, -75.554722),  // Barrio Niquía
-            Pair(6.320833, -75.570278),  // Barrio Cabañas
-            Pair(6.346111, -75.542778),  // Barrio La Cumbre
-
-            // Medellín - varios puntos
-            Pair(6.244747, -75.573101),  // Centro de Medellín
-            Pair(6.210129, -75.572380),  // El Poblado
-            Pair(6.256773, -75.589861),  // Laureles
-            Pair(6.231144, -75.586700),  // Estadio
-
-            // Envigado - varios puntos
-            Pair(6.175742, -75.591370),  // Centro de Envigado
-            Pair(6.168900, -75.574300),  // Zona norte de Envigado
-            Pair(6.184722, -75.585833),  // Barrio La Sebastiana
-            Pair(6.163889, -75.594444)   // Barrio La Mina
-        )
-
-        // Programar actualizaciones periódicas
-        val mockRunnable = object : Runnable {
-            private var currentLocationIndex = (Math.random() * locations.size).toInt()
-            private var count = 0
-
-            override fun run() {
-                // Elegir una ubicación aleatoria
-                currentLocationIndex = (Math.random() * locations.size).toInt()
-                val selectedLocation = locations[currentLocationIndex]
-
-                // Añadir pequeña variación para simular movimiento
-                val randomLat = selectedLocation.first + 0.001 * (Math.random() - 0.5)
-                val randomLng = selectedLocation.second + 0.001 * (Math.random() - 0.5)
-
-                // Determinar la ciudad basado en el índice
-                val city = when(currentLocationIndex) {
-                    in 0..3 -> "Bello"
-                    in 4..7 -> "Medellín"
-                    else -> "Envigado"
-                }
-
-                // Enviar ubicación y metadatos adicionales
-                sendMockLocation(randomLat, randomLng, city)
-
-                count++
-                if (count < 1000) { // Limitar a 1000 actualizaciones
-                    mainHandler.postDelayed(this, 10000) // Cada 10 segundos
-                }
-            }
-        }
-
-        // Guardar referencia al runnable
-        locationUpdateRunnable.add(mockRunnable)
-
-        // Iniciar el runnable de inmediato y luego periódicamente
-        mockRunnable.run()
-    }
-
-    private fun sendMockLocation(latitude: Double, longitude: Double, city: String = "") {
-        val mockLocation = Location("mock")
-        mockLocation.latitude = latitude
-        mockLocation.longitude = longitude
-        mockLocation.accuracy = 5f + (Math.random() * 10).toFloat() // Precisión entre 5 y 15 metros
-        mockLocation.time = System.currentTimeMillis()
-
-        // Añadir extras para transportar metadatos adicionales
-        val bundle = Bundle()
-        bundle.putString("city", city)
-        mockLocation.extras = bundle
-
-        Log.d(TAG, "📍 Ubicación simulada generada en $city: $latitude, $longitude")
-
-        // Procesar la ubicación simulada como si fuera real
-        handleNewLocation(mockLocation)
     }
 
     private fun stopLocationUpdates() {
@@ -690,6 +615,7 @@ class LocationService : Service() {
         intent.putExtra("latitude", location.latitude)
         intent.putExtra("longitude", location.longitude)
         intent.putExtra("accuracy", location.accuracy)
+        intent.putExtra("city", determinarCiudad(location.latitude, location.longitude))
 
         LocalBroadcastManager.getInstance(this).sendBroadcast(intent)
     }
@@ -744,7 +670,7 @@ class LocationService : Service() {
         createNotificationChannel()
 
         return NotificationCompat.Builder(this, CHANNEL_ID)
-            .setContentTitle("Rastreador de Ubicación")
+            .setContentTitle("Rastreador de Ubicación Real")
             .setContentText(text)
             .setSmallIcon(android.R.drawable.ic_menu_mylocation)
             .setPriority(NotificationCompat.PRIORITY_HIGH)
