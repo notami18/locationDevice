@@ -341,6 +341,7 @@ class LocationService : Service() {
             put("speed", if (location.hasSpeed()) location.speed else 0.0f)
             put("bearing", if (location.hasBearing()) location.bearing else 0.0f)
             put("isMock", location.isFromMockProvider)
+            put("isActive", true) // TODO: Por favor tener encuenta en cambiar el estado ya que segun esto se activa el web socket en el back
             put("city", city)
         }
 
@@ -358,9 +359,11 @@ class LocationService : Service() {
     private fun determinarCiudad(latitude: Double, longitude: Double): String {
         // Definir regiones de ciudades (versión simplificada)
         val regiones = listOf(
-            Triple("Bello", 6.333333, -75.558333),       // Centro de Bello
-            Triple("Medellín", 6.244747, -75.573101),    // Centro de Medellín
-            Triple("Envigado", 6.175742, -75.591370)     // Centro de Envigado
+            Triple("Bello", 6.333176, -75.573553),       // Centro de Bello
+            Triple("Medellín", 6.244338, -75.573553),    // Centro de Medellín
+            Triple("Envigado", 6.175294, -75.591888),     // Centro de Envigado
+            Triple("Sabaneta", 6.151537, -75.615293),
+            Triple("Itagüí", 6.184409, -75.599051),
         )
 
         // Encontrar la ciudad más cercana
