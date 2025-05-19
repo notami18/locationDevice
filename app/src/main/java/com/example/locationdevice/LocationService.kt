@@ -6,7 +6,6 @@ import android.content.Intent
 import android.content.pm.PackageManager
 import android.location.Location
 import android.os.Build
-import android.os.Bundle
 import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
@@ -19,15 +18,11 @@ import org.eclipse.paho.client.mqttv3.*
 import org.eclipse.paho.client.mqttv3.persist.MemoryPersistence
 import org.json.JSONObject
 import java.io.File
+import java.io.FileInputStream
+import java.io.FileOutputStream
 import java.io.FileWriter
-import java.io.InputStream
-import java.net.InetAddress
-import java.security.KeyFactory
 import java.security.KeyStore
-import java.security.PrivateKey
 import java.security.cert.CertificateFactory
-import java.security.cert.X509Certificate
-import java.security.spec.PKCS8EncodedKeySpec
 import java.text.SimpleDateFormat
 import java.util.*
 import java.util.concurrent.atomic.AtomicBoolean
@@ -46,7 +41,8 @@ class LocationService : Service() {
     private var mqttClient: MqttClient? = null
     private val clientId = "AndroidDevice_${UUID.randomUUID().toString().substring(0, 8)}"
     private val isConnecting = AtomicBoolean(false)
-    private var useLocalStorage = false
+    private var isConnected = false
+    private var useLocalStorage = true // Comenzar en modo local por defecto
 
     // Configuración MQTT para AWS IoT
     private val iotEndpoint = "d025874830hkteiu1u9o9-ats.iot.us-east-1.amazonaws.com"
@@ -94,56 +90,16 @@ class LocationService : Service() {
             // Listar archivos en assets para debug
             listAssetFiles()
 
-            // Probar conectividad básica
-            checkConnectivity()
+            // Inicializar conexión MQTT
+            initMqttClient()
 
-            // Iniciar actualizaciones de ubicación reales - IMPORTANTE
+            // Iniciar actualizaciones de ubicación reales
             startLocationUpdates()
 
             Log.d(TAG, "🟢 Servicio iniciado completamente")
         } catch (e: Exception) {
             Log.e(TAG, "❌ ERROR FATAL en onCreate: ${e.message}", e)
             e.printStackTrace()
-        }
-    }
-
-    private fun checkConnectivity() {
-        Thread {
-            try {
-                Log.d(TAG, "🔍 Verificando conectividad con AWS IoT endpoint...")
-
-                // Intentar hacer ping al endpoint
-                try {
-                    val address = InetAddress.getByName(iotEndpoint)
-                    val reachable = address.isReachable(3000)
-                    Log.d(TAG, "Ping a $iotEndpoint: ${if (reachable) "EXITOSO" else "FALLIDO"}")
-
-                    if (!reachable) {
-                        Log.w(TAG, "⚠️ No se puede alcanzar el endpoint. Problema de conectividad.")
-                        activateLocalMode("No se puede alcanzar AWS IoT")
-                        return@Thread
-                    }
-                } catch (e: Exception) {
-                    Log.e(TAG, "Error al intentar hacer ping: ${e.message}")
-                }
-
-                // Intentar conectar a AWS IoT
-                connectToAwsIot()
-
-            } catch (e: Exception) {
-                Log.e(TAG, "Error verificando conectividad: ${e.message}")
-                e.printStackTrace()
-            }
-        }.start()
-    }
-
-    private fun activateLocalMode(reason: String) {
-        Log.d(TAG, "🏠 Activando modo de almacenamiento local debido a: $reason")
-        useLocalStorage = true
-
-        Handler(Looper.getMainLooper()).post {
-            updateNotification("Modo local activo - sin conexión a AWS")
-            sendStatusUpdate("Modo sin conexión activo: $reason")
         }
     }
 
@@ -154,6 +110,240 @@ class LocationService : Service() {
             assetFiles?.forEach { Log.d(TAG, "- $it") }
         } catch (e: Exception) {
             Log.e(TAG, "Error listando assets: ${e.message}")
+        }
+    }
+
+    private fun initMqttClient() {
+        Thread {
+            try {
+                Log.d(TAG, "🔄 Inicializando cliente MQTT Paho para AWS IoT...")
+
+                // Preparar directorio de certificados
+                val certsDir = File(filesDir, "mqtt_certs")
+                if (!certsDir.exists()) {
+                    certsDir.mkdirs()
+                }
+
+                // Extraer certificados de assets a archivos
+                val caFile = File(certsDir, "ca.pem")
+                val clientCertFile = File(certsDir, "client.crt")
+                val privateKeyFile = File(certsDir, "private.key")
+
+                // Copiar certificados
+                assets.open(caCertFileName).use { input ->
+                    FileOutputStream(caFile).use { output -> input.copyTo(output) }
+                }
+
+                assets.open(clientCertFileName).use { input ->
+                    FileOutputStream(clientCertFile).use { output -> input.copyTo(output) }
+                }
+
+                assets.open(privateKeyFileName).use { input ->
+                    FileOutputStream(privateKeyFile).use { output -> input.copyTo(output) }
+                }
+
+                // Crear SSLContext con los certificados
+                val sslContext = createSSLContext(clientCertFile, privateKeyFile, caFile)
+
+                // Configurar opciones MQTT
+                val options = MqttConnectOptions().apply {
+                    isCleanSession = true
+                    connectionTimeout = 60
+                    keepAliveInterval = 30
+                    socketFactory = sslContext.socketFactory
+
+                    // Configurar Last Will Testament
+                    setWill(
+                        "$topic/status",
+                        """{"deviceId":"$clientId","status":"disconnected"}""".toByteArray(),
+                        0,
+                        false
+                    )
+                }
+
+                // URL del broker AWS IoT
+                val awsIotBroker = "ssl://$iotEndpoint:443"
+                Log.d(TAG, "Conectando a AWS IoT: $awsIotBroker")
+
+                // Crear cliente MQTT
+                mqttClient = MqttClient(awsIotBroker, clientId, MemoryPersistence())
+
+                // Configurar callbacks
+                mqttClient?.setCallback(object : MqttCallback {
+                    override fun connectionLost(cause: Throwable?) {
+                        Log.e(TAG, "Conexión AWS IoT perdida: ${cause?.message}")
+                        isConnected = false
+
+                        // Activar modo local
+                        activateLocalMode("Conexión perdida")
+
+                        // Programar un intento de reconexión con retraso
+                        val delay = 10000L  // 10 segundos
+                        Handler(Looper.getMainLooper()).postDelayed({
+                            if (mqttClient?.isConnected != true) {
+                                Log.d(TAG, "Intentando reconexión automática a AWS IoT...")
+                                connectMqtt(options)
+                            }
+                        }, delay)
+                    }
+
+                    override fun messageArrived(topic: String?, message: MqttMessage?) {
+                        if (topic != null && message != null) {
+                            Log.d(TAG, "Mensaje recibido en $topic: ${String(message.payload)}")
+                        }
+                    }
+
+                    override fun deliveryComplete(token: IMqttDeliveryToken?) {
+                        Log.d(TAG, "✅ Mensaje entregado a AWS IoT")
+                    }
+                })
+
+                // Conectar al broker
+                connectMqtt(options)
+
+            } catch (e: Exception) {
+                Log.e(TAG, "❌ Error inicializando MQTT: ${e.message}")
+                e.printStackTrace()
+                activateLocalMode("Error MQTT: ${e.javaClass.simpleName}")
+            }
+        }.start()
+    }
+
+    private fun connectMqtt(options: MqttConnectOptions) {
+        if (isConnecting.getAndSet(true)) {
+            Log.d(TAG, "⚠️ Conexión a AWS IoT ya en progreso")
+            return
+        }
+
+        try {
+            Log.d(TAG, "🔄 Conectando a AWS IoT vía Paho...")
+
+            mainHandler.post {
+                updateNotification("Conectando a AWS IoT...")
+                sendStatusUpdate("Conectando a AWS IoT...")
+            }
+
+            // Intentar conexión con timeout personalizado
+            mqttClient?.connect(options)
+
+            Log.d(TAG, "✅ Conectado a AWS IoT exitosamente")
+            isConnected = true
+            useLocalStorage = false
+
+            // Suscribirse a temas (opcional)
+            mqttClient?.subscribe("$topic/commands", 0)
+
+            // Enviar mensaje de conexión
+            val connectionMessage = JSONObject().apply {
+                put("deviceId", clientId)
+                put("status", "connected")
+                put("timestamp", System.currentTimeMillis())
+            }
+
+            publishMessage("$topic/status", connectionMessage.toString())
+
+            // Actualizar UI
+            mainHandler.post {
+                updateNotification("Conectado a AWS IoT")
+                sendStatusUpdate("Enviando datos a MongoDB vía IoT")
+            }
+
+        } catch (e: MqttException) {
+            Log.e(TAG, "❌ Error MQTT: ${e.message}, Código: ${e.reasonCode}")
+
+            // Logging detallado
+            when (e.reasonCode) {
+                MqttException.REASON_CODE_INVALID_PROTOCOL_VERSION.toInt() -> Log.e(TAG, "Versión MQTT inválida")
+                MqttException.REASON_CODE_INVALID_CLIENT_ID.toInt() -> Log.e(TAG, "ID de cliente rechazado")
+                MqttException.REASON_CODE_BROKER_UNAVAILABLE.toInt() -> Log.e(TAG, "Broker no disponible")
+                MqttException.REASON_CODE_FAILED_AUTHENTICATION.toInt() -> Log.e(TAG, "Error de autenticación - Certificados incorrectos")
+                MqttException.REASON_CODE_NOT_AUTHORIZED.toInt() -> Log.e(TAG, "No autorizado - Política restrictiva")
+                MqttException.REASON_CODE_CONNECTION_LOST.toInt() -> Log.e(TAG, "Conexión perdida")
+                MqttException.REASON_CODE_CLIENT_EXCEPTION.toInt() -> Log.e(TAG, "Excepción de cliente - Problema de red")
+                else -> Log.e(TAG, "Otro error MQTT: ${e.reasonCode}")
+            }
+
+            // Activar modo local
+            activateLocalMode("Error de conexión: ${e.reasonCode}")
+
+        } catch (e: Exception) {
+            Log.e(TAG, "❌ Error general: ${e.message}")
+            e.printStackTrace()
+            activateLocalMode("Error: ${e.javaClass.simpleName}")
+        } finally {
+            isConnecting.set(false)
+        }
+    }
+
+    private fun createSSLContext(clientCertFile: File, privateKeyFile: File, caFile: File): SSLContext {
+        try {
+            // Cargar certificado CA
+            val caFactory = CertificateFactory.getInstance("X.509")
+            val caInputStream = FileInputStream(caFile)
+            val caCert = caFactory.generateCertificate(caInputStream)
+            caInputStream.close()
+
+            // Cargar certificado cliente
+            val clientCertInputStream = FileInputStream(clientCertFile)
+            val clientCert = caFactory.generateCertificate(clientCertInputStream)
+            clientCertInputStream.close()
+
+            // Crear KeyStore
+            val keyStore = KeyStore.getInstance(KeyStore.getDefaultType())
+            keyStore.load(null)
+
+            // Añadir certificado CA
+            keyStore.setCertificateEntry("ca-certificate", caCert)
+
+            // Añadir certificado cliente
+            keyStore.setCertificateEntry("client-certificate", clientCert)
+
+            // Configurar TrustManager
+            val tmf = TrustManagerFactory.getInstance(TrustManagerFactory.getDefaultAlgorithm())
+            tmf.init(keyStore)
+
+            // Configurar KeyManager
+            val kmf = KeyManagerFactory.getInstance(KeyManagerFactory.getDefaultAlgorithm())
+            kmf.init(keyStore, null)
+
+            // Crear y configurar SSLContext
+            val sslContext = SSLContext.getInstance("TLSv1.2")
+            sslContext.init(kmf.keyManagers, tmf.trustManagers, null)
+
+            Log.d(TAG, "✅ SSLContext creado correctamente")
+            return sslContext
+
+        } catch (e: Exception) {
+            Log.e(TAG, "❌ Error creando SSLContext: ${e.message}")
+            e.printStackTrace()
+            throw e
+        }
+    }
+
+    private fun publishMessage(topic: String, payload: String) {
+        try {
+            if (mqttClient?.isConnected == true) {
+                val message = MqttMessage(payload.toByteArray())
+                message.qos = 0
+                mqttClient?.publish(topic, message)
+                Log.d(TAG, "✅ Mensaje publicado en $topic")
+            } else {
+                Log.e(TAG, "❌ No conectado a MQTT, no se puede publicar")
+                throw Exception("No conectado a MQTT")
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "❌ Error publicando mensaje: ${e.message}")
+            throw e
+        }
+    }
+
+    private fun activateLocalMode(reason: String) {
+        Log.d(TAG, "🏠 Activando modo de almacenamiento local debido a: $reason")
+        useLocalStorage = true
+
+        Handler(Looper.getMainLooper()).post {
+            updateNotification("Modo local activo - sin conexión a AWS")
+            sendStatusUpdate("Modo sin conexión activo: $reason")
         }
     }
 
@@ -168,162 +358,6 @@ class LocationService : Service() {
 
     override fun onBind(intent: Intent?): IBinder? {
         return null
-    }
-
-    private fun connectToAwsIot() {
-        // Si ya está conectándose, no iniciar otra conexión
-        if (isConnecting.getAndSet(true)) {
-            Log.d(TAG, "⚠️ Conexión a AWS IoT ya en progreso, ignorando solicitud")
-            return
-        }
-
-        Thread {
-            try {
-                Log.d(TAG, "🔄 Iniciando conexión a AWS IoT Core...")
-
-                // Desconectar cliente existente si hay uno
-                try {
-                    if (mqttClient?.isConnected == true) {
-                        mqttClient?.disconnect()
-                        Log.d(TAG, "Cliente MQTT previo desconectado")
-                    }
-                } catch (e: Exception) {
-                    Log.w(TAG, "Error al desconectar cliente existente: ${e.message}")
-                }
-
-                // Cargar certificados desde assets
-                val caCertInputStream = applicationContext.assets.open(caCertFileName)
-                val clientCertInputStream = applicationContext.assets.open(clientCertFileName)
-                val privateKeyInputStream = applicationContext.assets.open(privateKeyFileName)
-
-                Log.d(TAG, "✅ Certificados cargados correctamente")
-
-                // Procesar certificados
-                val caCert = loadCertificate(caCertInputStream)
-                val clientCert = loadCertificate(clientCertInputStream)
-                val privateKey = loadPrivateKeyFromPEM(privateKeyInputStream)
-
-                Log.d(TAG, "✅ Certificados procesados correctamente")
-
-                // Crear SSLContext
-                val sslContext = createSSLContext(clientCert, privateKey, caCert)
-
-                // Configurar opciones MQTT
-                val options = MqttConnectOptions().apply {
-                    isCleanSession = true
-                    connectionTimeout = 60
-                    keepAliveInterval = 60  // Aumentado de 30 a 60 segundos
-                    socketFactory = sslContext.socketFactory
-
-                    // Configurar Last Will Testament para saber cuando se desconecta
-                    setWill(
-                        "$topic/status",
-                        """{"deviceId":"$clientId","status":"disconnected"}""".toByteArray(),
-                        0,
-                        false
-                    )
-                }
-
-                // Preparar conexión a AWS IoT
-                val awsIotBroker = "ssl://$iotEndpoint:8883"
-                Log.d(TAG, "Conectando a AWS IoT: $awsIotBroker")
-
-                // Crear cliente MQTT
-                mqttClient = MqttClient(awsIotBroker, clientId, MemoryPersistence())
-
-                // Configurar callbacks
-                mqttClient?.setCallback(object : MqttCallback {
-                    override fun connectionLost(cause: Throwable?) {
-                        Log.e(TAG, "Conexión AWS IoT perdida: ${cause?.message}")
-                        isConnecting.set(false)
-
-                        // Programar un intento de reconexión con retraso
-                        val delay = 5000L  // 5 segundos
-                        Handler(Looper.getMainLooper()).postDelayed({
-                            if (!mqttClient?.isConnected!! == true) {
-                                Log.d(TAG, "Intentando reconexión automática a AWS IoT...")
-                                connectToAwsIot()
-                            }
-                        }, delay)
-                    }
-
-                    override fun messageArrived(topic: String?, message: MqttMessage?) {
-                        // No esperamos recibir mensajes
-                    }
-
-                    override fun deliveryComplete(token: IMqttDeliveryToken?) {
-                        Log.d(TAG, "✅ Mensaje entregado a AWS IoT")
-                    }
-                })
-
-                // Conectar con manejo detallado de errores
-                try {
-                    Log.d(TAG, "Intentando conexión MQTT explícita...")
-                    mqttClient?.connect(options)
-                    Log.d(TAG, "✅ Conectado a AWS IoT correctamente")
-
-                    // Desactivar modo local
-                    useLocalStorage = false
-                } catch (e: MqttException) {
-                    // Log detallado del error MQTT
-                    Log.e(TAG, "❌ MqttException: ${e.message}, Código: ${e.reasonCode}, Causa: ${e.cause?.message}")
-                    when (e.reasonCode) {
-                        MqttException.REASON_CODE_CLIENT_EXCEPTION.toInt() -> {
-                            Log.e(TAG, "Error de cliente MQTT (posiblemente problemas de red)")
-                            activateLocalMode("Problemas de red")
-                        }
-                        MqttException.REASON_CODE_INVALID_PROTOCOL_VERSION.toInt().toInt() -> Log.e(TAG, "Versión de protocolo MQTT inválida")
-                        MqttException.REASON_CODE_INVALID_CLIENT_ID.toInt() -> Log.e(TAG, "ID de cliente inválido")
-                        MqttException.REASON_CODE_BROKER_UNAVAILABLE.toInt() -> {
-                            Log.e(TAG, "Broker no disponible (endpoint incorrecto o problemas de red)")
-                            activateLocalMode("Broker no disponible")
-                        }
-                        MqttException.REASON_CODE_FAILED_AUTHENTICATION.toInt().toInt() -> Log.e(TAG, "Autenticación fallida (certificados incorrectos)")
-                        MqttException.REASON_CODE_NOT_AUTHORIZED.toInt().toInt() -> Log.e(TAG, "No autorizado (falta política en AWS IoT)")
-                        MqttException.REASON_CODE_SUBSCRIBE_FAILED.toInt().toInt() -> Log.e(TAG, "Suscripción fallida")
-                        MqttException.REASON_CODE_CLIENT_TIMEOUT.toInt() -> {
-                            Log.e(TAG, "Timeout de cliente")
-                            activateLocalMode("Timeout de conexión")
-                        }
-                        MqttException.REASON_CODE_NO_MESSAGE_IDS_AVAILABLE.toInt() -> Log.e(TAG, "No hay IDs de mensaje disponibles")
-                        MqttException.REASON_CODE_CONNECTION_LOST.toInt() -> {
-                            Log.e(TAG, "Conexión perdida")
-                            activateLocalMode("Conexión perdida")
-                        }
-                        else -> {
-                            Log.e(TAG, "Otro error MQTT: ${e.reasonCode}")
-                            activateLocalMode("Error MQTT ${e.reasonCode}")
-                        }
-                    }
-                    e.printStackTrace()
-                    throw e
-                }
-
-                Log.d(TAG, "✅ Conectado exitosamente a AWS IoT")
-
-                // Actualizar UI
-                Handler(Looper.getMainLooper()).post {
-                    updateNotification("Conectado a AWS IoT")
-                    sendStatusUpdate("Enviando datos a MongoDB vía IoT")
-                }
-
-            } catch (e: Exception) {
-                Log.e(TAG, "❌ Error AWS IoT: ${e.javaClass.simpleName} - ${e.message}")
-                e.printStackTrace()
-
-                // Actualizar UI con el error
-                Handler(Looper.getMainLooper()).post {
-                    updateNotification("Error de conexión IoT: ${e.javaClass.simpleName}")
-                    sendStatusUpdate("Error: ${e.message}")
-                }
-
-                // En caso de error, activar modo local
-                activateLocalMode("Error de conexión: ${e.javaClass.simpleName}")
-            } finally {
-                // Siempre marcar que ya no está conectándose
-                isConnecting.set(false)
-            }
-        }.start()
     }
 
     private fun publishLocationData(location: Location) {
@@ -341,19 +375,66 @@ class LocationService : Service() {
             put("speed", if (location.hasSpeed()) location.speed else 0.0f)
             put("bearing", if (location.hasBearing()) location.bearing else 0.0f)
             put("isMock", location.isFromMockProvider)
-            put("isActive", true) // TODO: Por favor tener encuenta en cambiar el estado ya que segun esto se activa el web socket en el back
+            put("isActive", true)
             put("city", city)
         }
 
         // Decidir si usar almacenamiento local o AWS IoT
-        if (useLocalStorage || mqttClient?.isConnected != true) {
+        if (useLocalStorage || !isConnected) {
             // Almacenamiento local
             saveLocationLocally(payload)
         } else {
             // Enviar a AWS IoT
-            publishToAwsIot(payload)
+            try {
+                publishMessage(topic, payload.toString())
+
+                mainHandler.post {
+                    sendStatusUpdate("✅ Datos enviados a AWS IoT")
+                }
+            } catch (e: Exception) {
+                Log.e(TAG, "❌ Error al publicar: ${e.message}")
+
+                // Guardar localmente en caso de error
+                saveLocationLocally(payload)
+            }
         }
     }
+
+    private fun saveLocationLocally(payload: JSONObject) {
+        Thread {
+            try {
+                // Crear directorio si no existe
+                val dir = File(getExternalFilesDir(null), "location_data")
+                if (!dir.exists()) {
+                    dir.mkdirs()
+                }
+
+                // Crear nombre de archivo con fecha/hora
+                val timestamp = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.getDefault()).format(Date())
+                val file = File(dir, "location_${timestamp}.json")
+
+                // Escribir datos en archivo
+                FileWriter(file).use { writer ->
+                    writer.write(payload.toString())
+                }
+
+                Log.d(TAG, "✅ Datos guardados localmente en: ${file.absolutePath}")
+
+                Handler(Looper.getMainLooper()).post {
+                    sendStatusUpdate("✅ Datos guardados localmente")
+                }
+
+            } catch (e: Exception) {
+                Log.e(TAG, "❌ Error al guardar localmente: ${e.message}")
+
+                Handler(Looper.getMainLooper()).post {
+                    sendStatusUpdate("❌ Error al guardar: ${e.message}")
+                }
+            }
+        }.start()
+    }
+
+    // Resto de tu código (determinarCiudad, calcularDistancia, etc) permanece igual...
 
     // Función para determinar la ciudad basada en coordenadas
     private fun determinarCiudad(latitude: Double, longitude: Double): String {
@@ -399,142 +480,6 @@ class LocationService : Service() {
         val c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a))
 
         return radioTierra * c // Distancia en kilómetros
-    }
-
-    private fun saveLocationLocally(payload: JSONObject) {
-        Thread {
-            try {
-                // Crear directorio si no existe
-                val dir = File(getExternalFilesDir(null), "location_data")
-                if (!dir.exists()) {
-                    dir.mkdirs()
-                }
-
-                // Crear nombre de archivo con fecha/hora
-                val timestamp = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.getDefault()).format(Date())
-                val file = File(dir, "location_${timestamp}.json")
-
-                // Escribir datos en archivo
-                FileWriter(file).use { writer ->
-                    writer.write(payload.toString())
-                }
-
-                Log.d(TAG, "✅ Datos guardados localmente en: ${file.absolutePath}")
-
-                Handler(Looper.getMainLooper()).post {
-                    sendStatusUpdate("✅ Datos guardados localmente")
-                }
-
-            } catch (e: Exception) {
-                Log.e(TAG, "❌ Error al guardar localmente: ${e.message}")
-
-                Handler(Looper.getMainLooper()).post {
-                    sendStatusUpdate("❌ Error al guardar: ${e.message}")
-                }
-            }
-        }.start()
-    }
-
-    private fun publishToAwsIot(payload: JSONObject) {
-        Thread {
-            try {
-                val message = MqttMessage(payload.toString().toByteArray())
-                message.qos = 0
-
-                Log.d(TAG, "📤 Publicando en $topic: $payload")
-                mqttClient?.publish(topic, message)
-
-                Handler(Looper.getMainLooper()).post {
-                    sendStatusUpdate("✅ Datos enviados a AWS IoT")
-                }
-
-            } catch (e: Exception) {
-                Log.e(TAG, "❌ Error al publicar: ${e.javaClass.simpleName} - ${e.message}")
-                e.printStackTrace()
-
-                // Si hay error, activar modo local
-                activateLocalMode("Error de publicación: ${e.message}")
-
-                // Y guardar el dato actual localmente
-                saveLocationLocally(payload)
-            }
-        }.start()
-    }
-
-    // Funciones auxiliares para SSL
-    private fun loadCertificate(inputStream: InputStream): X509Certificate {
-        val certificateFactory = CertificateFactory.getInstance("X.509")
-        return certificateFactory.generateCertificate(inputStream) as X509Certificate
-    }
-
-    private fun loadPrivateKeyFromPEM(inputStream: InputStream): PrivateKey {
-        val privateKeyPEM = inputStream.bufferedReader().use { it.readText() }
-            .replace("-----BEGIN RSA PRIVATE KEY-----", "")
-            .replace("-----END RSA PRIVATE KEY-----", "")
-            .replace("-----BEGIN PRIVATE KEY-----", "")
-            .replace("-----END PRIVATE KEY-----", "")
-            .replace("\\s+".toRegex(), "")
-
-        Log.d(TAG, "Procesando clave privada (longitud Base64: ${privateKeyPEM.length})")
-
-        try {
-            // Decodificar Base64
-            val keyBytes = android.util.Base64.decode(privateKeyPEM, android.util.Base64.DEFAULT)
-
-            // Intentar diferentes formatos de clave
-            try {
-                // Intentar como clave PKCS8
-                Log.d(TAG, "Intentando formato PKCS8...")
-                val keyFactory = KeyFactory.getInstance("RSA")
-                val keySpec = PKCS8EncodedKeySpec(keyBytes)
-                return keyFactory.generatePrivate(keySpec)
-            } catch (e: Exception) {
-                Log.e(TAG, "Error con formato PKCS8: ${e.message}")
-                throw e
-            }
-        } catch (e: Exception) {
-            Log.e(TAG, "Error procesando clave privada: ${e.message}")
-            e.printStackTrace()
-            throw e
-        }
-    }
-
-    private fun createSSLContext(
-        clientCert: X509Certificate,
-        privateKey: PrivateKey,
-        caCert: X509Certificate
-    ): SSLContext {
-        try {
-            // Crear KeyStore
-            val keyStore = KeyStore.getInstance(KeyStore.getDefaultType())
-            keyStore.load(null)
-
-            // Agregar certificado CA
-            keyStore.setCertificateEntry("ca-certificate", caCert)
-
-            // Agregar certificado y clave privada del cliente
-            keyStore.setKeyEntry("client-key", privateKey, null, arrayOf(clientCert))
-            Log.d(TAG, "KeyStore configurado correctamente")
-
-            // Configurar TrustManager
-            val tmf = TrustManagerFactory.getInstance(TrustManagerFactory.getDefaultAlgorithm())
-            tmf.init(keyStore)
-
-            // Configurar KeyManager
-            val kmf = KeyManagerFactory.getInstance(KeyManagerFactory.getDefaultAlgorithm())
-            kmf.init(keyStore, null)
-
-            // Crear y configurar SSLContext
-            val sslContext = SSLContext.getInstance("TLSv1.2")
-            sslContext.init(kmf.keyManagers, tmf.trustManagers, null)
-            Log.d(TAG, "SSLContext creado correctamente")
-
-            return sslContext
-        } catch (e: Exception) {
-            Log.e(TAG, "Error creando SSLContext: ${e.message}")
-            e.printStackTrace()
-            throw e
-        }
     }
 
     private fun setupLocationCallback() {
@@ -584,12 +529,12 @@ class LocationService : Service() {
                 }
             }
 
-            // Configurar solicitud de ubicaciones REALES - CLAVE PARA USAR GPS REAL
+            // Configurar solicitud de ubicaciones REALES
             val locationRequest = LocationRequest.Builder(UPDATE_INTERVAL)
-                .setPriority(Priority.PRIORITY_HIGH_ACCURACY) // IMPORTANTE: Alta precisión = GPS
+                .setPriority(Priority.PRIORITY_HIGH_ACCURACY)
                 .setMinUpdateDistanceMeters(SMALLEST_DISPLACEMENT)
                 .setMinUpdateIntervalMillis(FASTEST_INTERVAL)
-                .setWaitForAccurateLocation(true) // Esperar precisión alta
+                .setWaitForAccurateLocation(true)
                 .build()
 
             // Iniciar actualizaciones
@@ -649,9 +594,23 @@ class LocationService : Service() {
         // Desconectar MQTT
         try {
             if (mqttClient?.isConnected == true) {
+                // Publicar mensaje de desconexión
+                val lastMessage = JSONObject().apply {
+                    put("deviceId", clientId)
+                    put("status", "disconnected_graceful")
+                    put("timestamp", System.currentTimeMillis())
+                }
+
+                val message = MqttMessage(lastMessage.toString().toByteArray())
+                message.qos = 0
+                mqttClient?.publish("$topic/status", message)
+
+                // Pequeña pausa para garantizar que el mensaje se envíe
+                Thread.sleep(500)
+
                 mqttClient?.disconnect()
+                mqttClient?.close()
             }
-            mqttClient?.close()
         } catch (e: Exception) {
             Log.e(TAG, "Error al desconectar MQTT: ${e.message}")
         }

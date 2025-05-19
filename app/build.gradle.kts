@@ -37,6 +37,21 @@ android {
     buildFeatures {
         compose = true
     }
+
+    packagingOptions {
+        resources {
+            excludes += listOf(
+                "META-INF/LICENSE.txt",
+                "META-INF/NOTICE.txt",
+                "META-INF/LICENSE",
+                "META-INF/NOTICE"
+            )
+            pickFirsts += listOf(
+                "AndroidManifest.xml",
+                "META-INF/DEPENDENCIES"
+            )
+        }
+    }
 }
 
 dependencies {
@@ -66,12 +81,18 @@ dependencies {
     // Ubicación
     implementation("com.google.android.gms:play-services-location:21.0.1")
 
-    // MQTT Paho
+    // AWS IoT Core SDK - versiones más estables
+    implementation("com.amazonaws:aws-android-sdk-iot:2.60.0")
+    implementation("com.amazonaws:aws-android-sdk-auth-core:2.60.0")
+    implementation("com.amazonaws:aws-android-sdk-mobile-client:2.60.0")
+
+    // Si necesitas MQTT específicamente, usa esta versión
+    implementation("com.amazonaws:aws-android-sdk-iot:2.60.0@aar")
+
+    // MQTT Paho - ¡Dejamos esto para usarlo en nuestra nueva implementación!
     implementation("org.eclipse.paho:org.eclipse.paho.client.mqttv3:1.2.5")
     implementation("org.eclipse.paho:org.eclipse.paho.android.service:1.1.1")
 
     // Para BroadcastManager
     implementation("androidx.localbroadcastmanager:localbroadcastmanager:1.1.0")
-
-    implementation("org.bouncycastle:bcprov-jdk15on:1.70")
 }

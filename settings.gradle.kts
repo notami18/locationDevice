@@ -12,10 +12,15 @@ pluginManagement {
     }
 }
 dependencyResolutionManagement {
-    repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
-    repositories {
-        google()
-        mavenCentral()
+    dependencyResolutionManagement {
+        repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+        repositories {
+            google()
+            mavenCentral()
+            // Añade los repositorios de AWS
+            maven { url = uri("https://aws.amazon.com/maven/") }
+            maven { url = uri("https://s3.amazonaws.com/repo.commonsware.com") }
+        }
     }
 }
 

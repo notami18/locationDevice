@@ -1,0 +1,6 @@
+{
+  "sonarlint.connectedMode.project": {
+    "connectionId": "dev-metro-int",
+    "projectKey": "metro_medellin_app_naked_android"
+  }
+}
