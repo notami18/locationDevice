@@ -73,5 +73,14 @@ dependencies {
     // Para BroadcastManager
     implementation("androidx.localbroadcastmanager:localbroadcastmanager:1.1.0")
 
+    // Coroutines para operaciones asíncronas
+    implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.7.3")
+    implementation("org.jetbrains.kotlinx:kotlinx-coroutines-core:1.7.3")
+
+    // AWS Amplify (para integración con Cognito - comentado hasta implementación completa)
+    // implementation("com.amplifyframework:aws-auth-cognito:2.14.5")
+    // implementation("com.amplifyframework:aws-api:2.14.5")
+    // implementation("com.amplifyframework:core:2.14.5")
+
     implementation("org.bouncycastle:bcprov-jdk15on:1.70")
 }

@@ -34,6 +34,7 @@ import java.util.concurrent.atomic.AtomicBoolean
 import javax.net.ssl.KeyManagerFactory
 import javax.net.ssl.SSLContext
 import javax.net.ssl.TrustManagerFactory
+import kotlinx.coroutines.*
 
 class LocationService : Service() {
 
@@ -42,20 +43,18 @@ class LocationService : Service() {
     private lateinit var fusedLocationClient: FusedLocationProviderClient
     private lateinit var locationCallback: LocationCallback
 
-    // Cliente MQTT
+    // Cliente MQTT y certificados dinámicos
     private var mqttClient: MqttClient? = null
-    private val clientId = "AndroidDevice_${UUID.randomUUID().toString().substring(0, 8)}"
+    private lateinit var certificateManager: CertificateManager
+    private lateinit var localStorageManager: LocalStorageManager
+    private var deviceCertInfo: CertificateManager.DeviceCertificateInfo? = null
+    private val clientId: String get() = deviceCertInfo?.thingName ?: "fallback-device"
     private val isConnecting = AtomicBoolean(false)
     private var useLocalStorage = false
 
     // Configuración MQTT para AWS IoT
     private val iotEndpoint = "d025874830hkteiu1u9o9-ats.iot.us-east-1.amazonaws.com"
     private val topic = "devices/location"
-
-    // Nombres de archivos de certificados
-    private val caCertFileName = "AmazonRootCA1.pem"
-    private val clientCertFileName = "5380b2554d73d1c2afe68cbc61e71f02d6fb314b1d660423b70f50eaa2c3cac8-certificate.pem.crt"
-    private val privateKeyFileName = "5380b2554d73d1c2afe68cbc61e71f02d6fb314b1d660423b70f50eaa2c3cac8-private.pem.key"
 
     private val NOTIFICATION_ID = 12345
     private val CHANNEL_ID = "location_service_channel"
@@ -82,6 +81,10 @@ class LocationService : Service() {
                 Log.d(TAG, "✅ Permisos de ubicación OK")
             }
 
+            // Inicializar gestores
+            certificateManager = CertificateManager(this)
+            localStorageManager = LocalStorageManager(this)
+
             // Inicializar cliente de ubicación
             fusedLocationClient = LocationServices.getFusedLocationProviderClient(this)
 
@@ -89,13 +92,10 @@ class LocationService : Service() {
             setupLocationCallback()
 
             // Iniciar como servicio en primer plano con notificación
-            startForeground(NOTIFICATION_ID, createNotification("Iniciando servicio de ubicación..."))
+            startForeground(NOTIFICATION_ID, createNotification("Inicializando certificados dinámicos..."))
 
-            // Listar archivos en assets para debug
-            listAssetFiles()
-
-            // Probar conectividad básica
-            checkConnectivity()
+            // Inicializar certificados antes de conectar
+            initializeDeviceCertificates()
 
             // Iniciar actualizaciones de ubicación reales - IMPORTANTE
             startLocationUpdates()
@@ -107,10 +107,79 @@ class LocationService : Service() {
         }
     }
 
+    /**
+     * Inicializa certificados dinámicos específicos del dispositivo
+     */
+    private fun initializeDeviceCertificates() {
+        // Usar corrutina para operaciones asíncronas
+        CoroutineScope(Dispatchers.IO).launch {
+            try {
+                Log.d(TAG, "🔐 Inicializando certificados dinámicos...")
+                
+                // 1. Obtener información de certificados del dispositivo
+                deviceCertInfo = certificateManager.getDeviceCertificateInfo()
+                
+                if (deviceCertInfo == null) {
+                    Log.e(TAG, "❌ No se pudo obtener información de certificados")
+                    withContext(Dispatchers.Main) {
+                        activateLocalMode("Error obteniendo información de certificados")
+                    }
+                    return@launch
+                }
+                
+                Log.d(TAG, "📱 Dispositivo ID: ${deviceCertInfo!!.deviceId}")
+                Log.d(TAG, "🏷️ Thing Name: ${deviceCertInfo!!.thingName}")
+                
+                // 2. Verificar si los certificados existen localmente
+                val certificatesAvailable = certificateManager.areCertificatesAvailable(deviceCertInfo!!)
+                
+                if (!certificatesAvailable) {
+                    Log.d(TAG, "📥 Certificados no encontrados localmente, descargando...")
+                    
+                    withContext(Dispatchers.Main) {
+                        updateNotification("Descargando certificados únicos...")
+                    }
+                    
+                    // 3. Descargar certificados del backend
+                    val downloadSuccess = certificateManager.downloadDeviceCertificates(deviceCertInfo!!)
+                    
+                    if (!downloadSuccess) {
+                        Log.e(TAG, "❌ No se pudieron descargar certificados")
+                        withContext(Dispatchers.Main) {
+                            activateLocalMode("Error descargando certificados")
+                        }
+                        return@launch
+                    }
+                }
+                
+                Log.d(TAG, "✅ Certificados inicializados correctamente")
+                
+                // 4. Proceder con conectividad una vez que los certificados están listos
+                withContext(Dispatchers.Main) {
+                    updateNotification("Certificados listos, verificando conectividad...")
+                    checkConnectivity()
+                }
+                
+            } catch (e: Exception) {
+                Log.e(TAG, "❌ Error inicializando certificados: ${e.message}", e)
+                withContext(Dispatchers.Main) {
+                    activateLocalMode("Error de certificados: ${e.message}")
+                }
+            }
+        }
+    }
+
     private fun checkConnectivity() {
         Thread {
             try {
                 Log.d(TAG, "🔍 Verificando conectividad con AWS IoT endpoint...")
+                
+                // Verificar que tengamos certificados antes de proceder
+                if (deviceCertInfo == null) {
+                    Log.e(TAG, "❌ No hay información de certificados disponible")
+                    activateLocalMode("Sin certificados de dispositivo")
+                    return@Thread
+                }
 
                 // Intentar hacer ping al endpoint
                 try {
@@ -127,7 +196,7 @@ class LocationService : Service() {
                     Log.e(TAG, "Error al intentar hacer ping: ${e.message}")
                 }
 
-                // Intentar conectar a AWS IoT
+                // Intentar conectar a AWS IoT con certificados dinámicos
                 connectToAwsIot()
 
             } catch (e: Exception) {
@@ -179,7 +248,15 @@ class LocationService : Service() {
 
         Thread {
             try {
-                Log.d(TAG, "🔄 Iniciando conexión a AWS IoT Core...")
+                Log.d(TAG, "🔄 Iniciando conexión a AWS IoT Core con certificados dinámicos...")
+                
+                // Verificar que tengamos información de certificados
+                val certInfo = deviceCertInfo
+                if (certInfo == null) {
+                    Log.e(TAG, "❌ No hay información de certificados disponible")
+                    activateLocalMode("Sin información de certificados")
+                    return@Thread
+                }
 
                 // Desconectar cliente existente si hay uno
                 try {
@@ -191,19 +268,23 @@ class LocationService : Service() {
                     Log.w(TAG, "Error al desconectar cliente existente: ${e.message}")
                 }
 
-                // Cargar certificados desde assets
-                val caCertInputStream = applicationContext.assets.open(caCertFileName)
-                val clientCertInputStream = applicationContext.assets.open(clientCertFileName)
-                val privateKeyInputStream = applicationContext.assets.open(privateKeyFileName)
+                // Cargar certificados dinámicos específicos del dispositivo
+                val certificateFiles = certificateManager.loadDeviceCertificatesFromStorage(certInfo)
+                
+                if (certificateFiles == null) {
+                    Log.e(TAG, "❌ No se pudieron cargar certificados del dispositivo")
+                    activateLocalMode("Error cargando certificados")
+                    return@Thread
+                }
 
-                Log.d(TAG, "✅ Certificados cargados correctamente")
+                Log.d(TAG, "✅ Certificados dinámicos cargados para dispositivo: ${certInfo.deviceId}")
 
                 // Procesar certificados
-                val caCert = loadCertificate(caCertInputStream)
-                val clientCert = loadCertificate(clientCertInputStream)
-                val privateKey = loadPrivateKeyFromPEM(privateKeyInputStream)
+                val caCert = loadCertificate(certificateFiles.caCertStream)
+                val clientCert = loadCertificate(certificateFiles.clientCertStream)
+                val privateKey = loadPrivateKeyFromPEM(certificateFiles.privateKeyStream)
 
-                Log.d(TAG, "✅ Certificados procesados correctamente")
+                Log.d(TAG, "✅ Certificados procesados correctamente para Thing: ${certInfo.thingName}")
 
                 // Crear SSLContext
                 val sslContext = createSSLContext(clientCert, privateKey, caCert)
@@ -300,10 +381,13 @@ class LocationService : Service() {
                 }
 
                 Log.d(TAG, "✅ Conectado exitosamente a AWS IoT")
+                
+                // Notificar al storage manager que MQTT está disponible
+                localStorageManager.onMqttConnected()
 
                 // Actualizar UI
                 Handler(Looper.getMainLooper()).post {
-                    updateNotification("Conectado a AWS IoT")
+                    updateNotification("Conectado a AWS IoT - Procesando cola pendiente")
                     sendStatusUpdate("Enviando datos a MongoDB vía IoT")
                 }
 
@@ -345,13 +429,20 @@ class LocationService : Service() {
             put("city", city)
         }
 
-        // Decidir si usar almacenamiento local o AWS IoT
-        if (useLocalStorage || mqttClient?.isConnected != true) {
-            // Almacenamiento local
-            saveLocationLocally(payload)
-        } else {
-            // Enviar a AWS IoT
+        // SIEMPRE usar el LocalStorageManager robusto
+        val mqttAvailable = !useLocalStorage && mqttClient?.isConnected == true
+        localStorageManager.saveLocation(payload, mqttAvailable)
+        
+        // Si MQTT está disponible, intentar envío directo también
+        if (mqttAvailable) {
             publishToAwsIot(payload)
+        } else {
+            Log.d(TAG, "📥 MQTT no disponible, ubicación guardada en sistema robusto de almacenamiento")
+            
+            Handler(Looper.getMainLooper()).post {
+                val stats = localStorageManager.getStorageStats()
+                sendStatusUpdate("📥 Datos en cola local: ${stats.pendingCount}")
+            }
         }
     }
 
@@ -401,39 +492,7 @@ class LocationService : Service() {
         return radioTierra * c // Distancia en kilómetros
     }
 
-    private fun saveLocationLocally(payload: JSONObject) {
-        Thread {
-            try {
-                // Crear directorio si no existe
-                val dir = File(getExternalFilesDir(null), "location_data")
-                if (!dir.exists()) {
-                    dir.mkdirs()
-                }
-
-                // Crear nombre de archivo con fecha/hora
-                val timestamp = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.getDefault()).format(Date())
-                val file = File(dir, "location_${timestamp}.json")
-
-                // Escribir datos en archivo
-                FileWriter(file).use { writer ->
-                    writer.write(payload.toString())
-                }
-
-                Log.d(TAG, "✅ Datos guardados localmente en: ${file.absolutePath}")
-
-                Handler(Looper.getMainLooper()).post {
-                    sendStatusUpdate("✅ Datos guardados localmente")
-                }
-
-            } catch (e: Exception) {
-                Log.e(TAG, "❌ Error al guardar localmente: ${e.message}")
-
-                Handler(Looper.getMainLooper()).post {
-                    sendStatusUpdate("❌ Error al guardar: ${e.message}")
-                }
-            }
-        }.start()
-    }
+    // Método obsoleto removido - ahora usa LocalStorageManager robusto
 
     private fun publishToAwsIot(payload: JSONObject) {
         Thread {
@@ -441,11 +500,12 @@ class LocationService : Service() {
                 val message = MqttMessage(payload.toString().toByteArray())
                 message.qos = 0
 
-                Log.d(TAG, "📤 Publicando en $topic: $payload")
+                Log.d(TAG, "📤 Publicando en $topic: ${payload.optDouble("latitude")}, ${payload.optDouble("longitude")}")
                 mqttClient?.publish(topic, message)
 
                 Handler(Looper.getMainLooper()).post {
-                    sendStatusUpdate("✅ Datos enviados a AWS IoT")
+                    val stats = localStorageManager.getStorageStats()
+                    sendStatusUpdate("✅ Enviado a AWS IoT (Cola: ${stats.pendingCount})")
                 }
 
             } catch (e: Exception) {
@@ -454,9 +514,9 @@ class LocationService : Service() {
 
                 // Si hay error, activar modo local
                 activateLocalMode("Error de publicación: ${e.message}")
-
-                // Y guardar el dato actual localmente
-                saveLocationLocally(payload)
+                
+                // El LocalStorageManager ya se encarga del almacenamiento automáticamente
+                Log.d(TAG, "🔄 Datos asegurados en LocalStorageManager para reintento")
             }
         }.start()
     }
@@ -656,6 +716,13 @@ class LocationService : Service() {
             Log.e(TAG, "Error al desconectar MQTT: ${e.message}")
         }
 
+        // Limpiar LocalStorageManager
+        try {
+            localStorageManager.cleanup()
+        } catch (e: Exception) {
+            Log.e(TAG, "Error limpiando LocalStorageManager: ${e.message}")
+        }
+        
         // Detener el servicio en primer plano
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             stopForeground(true)
