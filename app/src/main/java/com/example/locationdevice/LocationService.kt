@@ -4,6 +4,10 @@ import android.app.*
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.net.ConnectivityManager
+import android.net.Network
+import android.net.NetworkCapabilities
+import android.net.NetworkRequest
 import android.location.Location
 import android.os.Build
 import android.os.Bundle
@@ -62,6 +66,11 @@ class LocationService : Service() {
 
     private val mainHandler = Handler(Looper.getMainLooper())
     private val locationUpdateRunnable = mutableListOf<Runnable>()
+    private val syncCheckRunnable = Runnable { checkAndSync() }
+
+    // Network connectivity monitoring
+    private lateinit var connectivityManager: ConnectivityManager
+    private var networkCallback: ConnectivityManager.NetworkCallback? = null
 
     // Parámetros de ubicación real
     private val UPDATE_INTERVAL = 5000L  // 5 segundos entre actualizaciones
@@ -88,6 +97,9 @@ class LocationService : Service() {
             // Configurar callback de ubicación
             setupLocationCallback()
 
+            // Configurar monitoreo de conectividad de red
+            setupNetworkCallback()
+
             // Iniciar como servicio en primer plano con notificación
             startForeground(NOTIFICATION_ID, createNotification("Iniciando servicio de ubicación..."))
 
@@ -99,6 +111,9 @@ class LocationService : Service() {
 
             // Iniciar actualizaciones de ubicación reales - IMPORTANTE
             startLocationUpdates()
+
+            // Iniciar verificación periódica de sincronización
+            startSyncChecker()
 
             Log.d(TAG, "🟢 Servicio iniciado completamente")
         } catch (e: Exception) {
@@ -237,10 +252,13 @@ class LocationService : Service() {
                         Log.e(TAG, "Conexión AWS IoT perdida: ${cause?.message}")
                         isConnecting.set(false)
 
+                        // Activar modo local mientras se reconecta
+                        activateLocalMode("Conexión perdida: ${cause?.message}")
+
                         // Programar un intento de reconexión con retraso
                         val delay = 5000L  // 5 segundos
                         Handler(Looper.getMainLooper()).postDelayed({
-                            if (!mqttClient?.isConnected!! == true) {
+                            if (mqttClient?.isConnected != true) {
                                 Log.d(TAG, "Intentando reconexión automática a AWS IoT...")
                                 connectToAwsIot()
                             }
@@ -549,6 +567,62 @@ class LocationService : Service() {
         }
     }
 
+    private fun setupNetworkCallback() {
+        connectivityManager = getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
+        
+        networkCallback = object : ConnectivityManager.NetworkCallback() {
+            override fun onAvailable(network: Network) {
+                Log.d(TAG, "🌐 Red disponible - Verificando conexión a AWS IoT")
+                
+                // Pequeño retraso para asegurar que la red esté completamente establecida
+                Handler(Looper.getMainLooper()).postDelayed({
+                    // Solo intentar reconectar si no estamos ya conectados
+                    if (useLocalStorage || mqttClient?.isConnected != true) {
+                        Log.d(TAG, "🔄 Intentando reconectar a AWS IoT tras detectar red...")
+                        connectToAwsIot()
+                    }
+                }, 2000) // 2 segundos de espera
+            }
+            
+            override fun onLost(network: Network) {
+                Log.d(TAG, "📶 Red perdida - Activando modo local")
+                activateLocalMode("Red perdida")
+            }
+            
+            override fun onCapabilitiesChanged(network: Network, networkCapabilities: NetworkCapabilities) {
+                val hasInternet = networkCapabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
+                val hasValidated = networkCapabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED)
+                
+                Log.d(TAG, "🔍 Capacidades de red - Internet: $hasInternet, Validada: $hasValidated")
+                
+                if (hasInternet && hasValidated) {
+                    // La red tiene internet validado
+                    if (useLocalStorage || mqttClient?.isConnected != true) {
+                        Log.d(TAG, "🌐 Internet validado - Intentando conectar...")
+                        Handler(Looper.getMainLooper()).postDelayed({
+                            connectToAwsIot()
+                        }, 1000)
+                    }
+                }
+            }
+        }
+        
+        // Registrar el callback para redes con internet
+        val networkRequest = NetworkRequest.Builder()
+            .addCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
+            .addCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED)
+            .build()
+            
+        try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
+                connectivityManager.registerNetworkCallback(networkRequest, networkCallback!!)
+                Log.d(TAG, "✅ NetworkCallback registrado correctamente")
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "❌ Error registrando NetworkCallback: ${e.message}")
+        }
+    }
+
     private fun handleNewLocation(location: Location) {
         val lat = location.latitude
         val lng = location.longitude
@@ -648,6 +722,21 @@ class LocationService : Service() {
         }
         locationUpdateRunnable.clear()
 
+        // Cancelar verificador de sincronización
+        mainHandler.removeCallbacks(syncCheckRunnable)
+
+        // Desregistrar NetworkCallback
+        try {
+            networkCallback?.let { callback ->
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
+                    connectivityManager.unregisterNetworkCallback(callback)
+                    Log.d(TAG, "✅ NetworkCallback desregistrado")
+                }
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "Error al desregistrar NetworkCallback: ${e.message}")
+        }
+
         // Desconectar MQTT
         try {
             if (mqttClient?.isConnected == true) {
@@ -675,6 +764,16 @@ class LocationService : Service() {
             try {
                 Log.d(TAG, "🔄 Iniciando sincronización de datos pendientes...")
                 
+                // Verificar que estamos conectados antes de sincronizar
+                if (mqttClient?.isConnected != true) {
+                    Log.w(TAG, "⚠️ No se puede sincronizar: MQTT no está conectado")
+                    // Programar retry en 5 segundos
+                    Handler(Looper.getMainLooper()).postDelayed({
+                        syncPendingData()
+                    }, 5000)
+                    return@Thread
+                }
+                
                 val dir = File(getExternalFilesDir(null), "location_data")
                 if (!dir.exists()) {
                     Log.d(TAG, "No hay directorio de datos pendientes")
@@ -690,8 +789,16 @@ class LocationService : Service() {
                 Log.d(TAG, "📁 Encontrados ${pendingFiles.size} archivos pendientes para sincronizar")
                 
                 var syncedCount = 0
+                var failedCount = 0
+                
                 for (file in pendingFiles) {
                     try {
+                        // Verificar conexión antes de cada envío
+                        if (mqttClient?.isConnected != true) {
+                            Log.w(TAG, "⚠️ Conexión perdida durante sincronización")
+                            break
+                        }
+                        
                         val data = file.readText()
                         val message = MqttMessage(data.toByteArray())
                         message.qos = 1
@@ -712,21 +819,70 @@ class LocationService : Service() {
                         
                     } catch (e: Exception) {
                         Log.e(TAG, "❌ Error sincronizando archivo ${file.name}: ${e.message}")
+                        failedCount++
                         // No eliminar el archivo si hay error, para reintentarlo después
                     }
                 }
                 
-                Log.d(TAG, "✅ Sincronización completada: $syncedCount/${pendingFiles.size} archivos")
+                Log.d(TAG, "✅ Sincronización completada: $syncedCount/${pendingFiles.size} archivos (${failedCount} fallos)")
                 
                 Handler(Looper.getMainLooper()).post {
-                    sendStatusUpdate("✅ Sincronizados $syncedCount datos pendientes")
+                    if (syncedCount > 0) {
+                        sendStatusUpdate("✅ Sincronizados $syncedCount datos pendientes")
+                    }
+                    if (failedCount > 0) {
+                        sendStatusUpdate("⚠️ $failedCount archivos no pudieron sincronizarse")
+                    }
+                }
+                
+                // Si quedaron archivos sin sincronizar, programar retry
+                if (failedCount > 0) {
+                    Handler(Looper.getMainLooper()).postDelayed({
+                        Log.d(TAG, "🔄 Reintentando sincronización de archivos pendientes...")
+                        syncPendingData()
+                    }, 10000) // Retry en 10 segundos
                 }
                 
             } catch (e: Exception) {
                 Log.e(TAG, "❌ Error general en sincronización: ${e.message}")
                 e.printStackTrace()
+                
+                // Programar retry en caso de error general
+                Handler(Looper.getMainLooper()).postDelayed({
+                    Log.d(TAG, "🔄 Reintentando sincronización después de error...")
+                    syncPendingData()
+                }, 15000) // Retry en 15 segundos
             }
         }.start()
+    }
+
+    private fun startSyncChecker() {
+        // Verificar cada 30 segundos si hay datos pendientes y conexión disponible
+        val delay = 30000L // 30 segundos
+        mainHandler.postDelayed(syncCheckRunnable, delay)
+        Log.d(TAG, "🔄 Verificador de sincronización iniciado")
+    }
+
+    private fun checkAndSync() {
+        try {
+            // Si estamos conectados y no en modo local, verificar si hay datos pendientes
+            if (!useLocalStorage && mqttClient?.isConnected == true) {
+                val dir = File(getExternalFilesDir(null), "location_data")
+                if (dir.exists()) {
+                    val pendingFiles = dir.listFiles { file -> file.name.endsWith(".json") }
+                    if (pendingFiles != null && pendingFiles.isNotEmpty()) {
+                        Log.d(TAG, "🔄 Encontrados ${pendingFiles.size} archivos pendientes. Iniciando sincronización...")
+                        syncPendingData()
+                    }
+                }
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "Error en verificación de sincronización: ${e.message}")
+        } finally {
+            // Programar próxima verificación
+            val delay = 30000L // 30 segundos
+            mainHandler.postDelayed(syncCheckRunnable, delay)
+        }
     }
 
     // Métodos para notificación
