@@ -716,7 +716,7 @@ class LocationService : Service() {
                     }
                 }
                 
-                Log.d(TAG, "✅ Sincronización completada: $syncedCount/$\{pendingFiles.size} archivos")
+                Log.d(TAG, "✅ Sincronización completada: $syncedCount/${pendingFiles.size} archivos")
                 
                 Handler(Looper.getMainLooper()).post {
                     sendStatusUpdate("✅ Sincronizados $syncedCount datos pendientes")
