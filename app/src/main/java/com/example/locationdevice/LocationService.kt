@@ -301,6 +301,9 @@ class LocationService : Service() {
 
                 Log.d(TAG, "✅ Conectado exitosamente a AWS IoT")
 
+                // Sincronizar datos pendientes cuando se reconecte
+                syncPendingData()
+
                 // Actualizar UI
                 Handler(Looper.getMainLooper()).post {
                     updateNotification("Conectado a AWS IoT")
@@ -345,12 +348,11 @@ class LocationService : Service() {
             put("city", city)
         }
 
-        // Decidir si usar almacenamiento local o AWS IoT
-        if (useLocalStorage || mqttClient?.isConnected != true) {
-            // Almacenamiento local
-            saveLocationLocally(payload)
-        } else {
-            // Enviar a AWS IoT
+        // Siempre guardar localmente primero como respaldo
+        saveLocationLocally(payload)
+
+        // Luego intentar enviar por MQTT si hay conexión
+        if (!useLocalStorage && mqttClient?.isConnected == true) {
             publishToAwsIot(payload)
         }
     }
@@ -439,7 +441,7 @@ class LocationService : Service() {
         Thread {
             try {
                 val message = MqttMessage(payload.toString().toByteArray())
-                message.qos = 0
+                message.qos = 1
 
                 Log.d(TAG, "📤 Publicando en $topic: $payload")
                 mqttClient?.publish(topic, message)
@@ -666,6 +668,65 @@ class LocationService : Service() {
 
         // Llamar al método onDestroy de la superclase
         super.onDestroy()
+    }
+
+    private fun syncPendingData() {
+        Thread {
+            try {
+                Log.d(TAG, "🔄 Iniciando sincronización de datos pendientes...")
+                
+                val dir = File(getExternalFilesDir(null), "location_data")
+                if (!dir.exists()) {
+                    Log.d(TAG, "No hay directorio de datos pendientes")
+                    return@Thread
+                }
+                
+                val pendingFiles = dir.listFiles { file -> file.name.endsWith(".json") }
+                if (pendingFiles == null || pendingFiles.isEmpty()) {
+                    Log.d(TAG, "No hay archivos pendientes para sincronizar")
+                    return@Thread
+                }
+                
+                Log.d(TAG, "📁 Encontrados ${pendingFiles.size} archivos pendientes para sincronizar")
+                
+                var syncedCount = 0
+                for (file in pendingFiles) {
+                    try {
+                        val data = file.readText()
+                        val message = MqttMessage(data.toByteArray())
+                        message.qos = 1
+                        
+                        // Intentar enviar
+                        mqttClient?.publish(topic, message)
+                        
+                        // Si se envió exitosamente, eliminar el archivo
+                        if (file.delete()) {
+                            syncedCount++
+                            Log.d(TAG, "✅ Sincronizado y eliminado: ${file.name}")
+                        } else {
+                            Log.w(TAG, "⚠️ No se pudo eliminar archivo después de sincronizar: ${file.name}")
+                        }
+                        
+                        // Pequeña pausa entre envíos para no saturar
+                        Thread.sleep(100)
+                        
+                    } catch (e: Exception) {
+                        Log.e(TAG, "❌ Error sincronizando archivo ${file.name}: ${e.message}")
+                        // No eliminar el archivo si hay error, para reintentarlo después
+                    }
+                }
+                
+                Log.d(TAG, "✅ Sincronización completada: $syncedCount/$\{pendingFiles.size} archivos")
+                
+                Handler(Looper.getMainLooper()).post {
+                    sendStatusUpdate("✅ Sincronizados $syncedCount datos pendientes")
+                }
+                
+            } catch (e: Exception) {
+                Log.e(TAG, "❌ Error general en sincronización: ${e.message}")
+                e.printStackTrace()
+            }
+        }.start()
     }
 
     // Métodos para notificación
